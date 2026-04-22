@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Routes, Route } from 'react-router-dom';
-import { Plus, Search, Package, Edit, Trash2, Filter } from 'lucide-react';
+import { Plus, Search, Package, Edit, Trash2 } from 'lucide-react';
 import { productService, categoryService } from '../lib/services';
 import type { Product, Category, ProductFormData } from '../types';
 import { formatCurrency, getStockStatus, STOCK_STATUS_CONFIG, cn } from '../utils/helpers';
@@ -17,7 +17,7 @@ const DEFAULT_FORM: ProductFormData = {
 function ProductForm({ initial, categories, onSave, onClose }: {
   initial?: Partial<ProductFormData>;
   categories: Category[];
-  onSave: (data: ProductFormData) => Promise<void>;
+  onSave: (data: ProductFormData) => Promise<string | null>;
   onClose: () => void;
 }) {
   const [form, setForm] = useState<ProductFormData>({ ...DEFAULT_FORM, ...initial });
@@ -28,11 +28,13 @@ function ProductForm({ initial, categories, onSave, onClose }: {
     setForm(f => ({ ...f, [k]: v }));
 
   async function handleSave() {
-    if (!form.name) return setError('Nama produk wajib diisi');
-    if (form.selling_price <= 0) return setError('Harga jual harus lebih dari 0');
+    setError('');
+    if (!form.name.trim()) return setError('Nama produk wajib diisi');
+    if (!form.selling_price || form.selling_price <= 0) return setError('Harga jual harus lebih dari 0');
     setLoading(true);
-    await onSave(form);
+    const err = await onSave(form);
     setLoading(false);
+    if (err) setError(err);
   }
 
   const categoryOpts = categories.map(c => ({ value: c.id, label: c.name }));
@@ -40,27 +42,37 @@ function ProductForm({ initial, categories, onSave, onClose }: {
 
   return (
     <div className="space-y-4">
-      {error && <p className="text-sm text-red-500 bg-red-50 px-3 py-2 rounded-lg">{error}</p>}
+      {error && (
+        <div className="text-sm text-red-600 bg-red-50 border border-red-200 px-3 py-2.5 rounded-lg">
+          ⚠️ {error}
+        </div>
+      )}
       <Input label="Nama Produk *" value={form.name} onChange={e => set('name', e.target.value)} placeholder="Masukkan nama produk" />
       <div className="grid grid-cols-2 gap-3">
-        <Input label="SKU" value={form.sku} onChange={e => set('sku', e.target.value)} placeholder="Kode produk" />
+        <Input label="SKU / Kode" value={form.sku} onChange={e => set('sku', e.target.value)} placeholder="Opsional" />
         <Select label="Satuan" value={form.unit} onChange={e => set('unit', e.target.value)} options={unitOpts} />
       </div>
       <Select label="Kategori" value={form.category_id} onChange={e => set('category_id', e.target.value)}
-        options={categoryOpts} placeholder="Pilih kategori" />
+        options={categoryOpts} placeholder="— Pilih kategori —" />
       <div className="grid grid-cols-2 gap-3">
-        <Input label="Harga Jual *" type="number" value={form.selling_price} onChange={e => set('selling_price', +e.target.value)} />
-        <Input label="Harga Modal" type="number" value={form.cost_price} onChange={e => set('cost_price', +e.target.value)} />
+        <Input label="Harga Jual (Rp) *" type="number" min={0} value={form.selling_price}
+          onChange={e => set('selling_price', +e.target.value)} />
+        <Input label="Harga Modal (Rp)" type="number" min={0} value={form.cost_price}
+          onChange={e => set('cost_price', +e.target.value)} />
       </div>
-      <Input label="Stok Minimum" type="number" value={form.min_stock} onChange={e => set('min_stock', +e.target.value)} hint="Notifikasi jika stok di bawah angka ini" />
-      <Textarea label="Deskripsi" value={form.description} onChange={e => set('description', e.target.value)} placeholder="Deskripsi produk (opsional)" />
-      <div className="flex items-center gap-2">
-        <input type="checkbox" id="is_active" checked={form.is_active} onChange={e => set('is_active', e.target.checked)} className="rounded" />
-        <label htmlFor="is_active" className="text-sm text-slate-700">Produk aktif</label>
-      </div>
-      <div className="flex gap-2 pt-2">
-        <Button variant="outline" className="flex-1" onClick={onClose}>Batal</Button>
-        <Button className="flex-1" loading={loading} onClick={handleSave}>Simpan</Button>
+      <Input label="Stok Minimum" type="number" min={0} value={form.min_stock}
+        onChange={e => set('min_stock', +e.target.value)}
+        hint="Notifikasi jika stok di bawah angka ini" />
+      <Textarea label="Deskripsi" value={form.description}
+        onChange={e => set('description', e.target.value)} placeholder="Deskripsi produk (opsional)" />
+      <label className="flex items-center gap-2 cursor-pointer">
+        <input type="checkbox" checked={form.is_active} onChange={e => set('is_active', e.target.checked)}
+          className="w-4 h-4 rounded accent-indigo-600" />
+        <span className="text-sm text-slate-700">Produk aktif (tampil untuk transaksi)</span>
+      </label>
+      <div className="flex gap-2 pt-2 border-t border-slate-100">
+        <Button variant="outline" className="flex-1" onClick={onClose} disabled={loading}>Batal</Button>
+        <Button className="flex-1" loading={loading} onClick={handleSave}>Simpan Produk</Button>
       </div>
     </div>
   );
@@ -77,8 +89,12 @@ function ProductList() {
   const [deleting, setDeleting] = useState<string | null>(null);
 
   async function load() {
+    setLoading(true);
     const [p, c] = await Promise.all([
-      productService.getAll({ search: search || undefined, category_id: filterCat || undefined }),
+      productService.getAll({
+        search: search || undefined,
+        category_id: filterCat || undefined,
+      }),
       categoryService.getAll(),
     ]);
     setProducts(p.data || []);
@@ -88,19 +104,23 @@ function ProductList() {
 
   useEffect(() => { load(); }, [search, filterCat]);
 
-  async function handleSave(form: ProductFormData) {
+  // Returns error string or null on success
+  async function handleSave(form: ProductFormData): Promise<string | null> {
     if (editing) {
-      await productService.update(editing.id, form);
+      const { error } = await productService.update(editing.id, form);
+      if (error) return error;
     } else {
-      await productService.create(form);
+      const { error } = await productService.create(form);
+      if (error) return error;
     }
     setModal(null);
     setEditing(null);
     load();
+    return null;
   }
 
   async function handleDelete(id: string) {
-    if (!confirm('Hapus produk ini?')) return;
+    if (!confirm('Yakin ingin menghapus produk ini?')) return;
     setDeleting(id);
     await productService.delete(id);
     setDeleting(null);
@@ -132,12 +152,30 @@ function ProductList() {
         </Button>
       </div>
 
+      {/* Stats bar */}
+      <div className="flex gap-4 text-sm text-slate-500">
+        <span>{products.length} produk</span>
+        <span>·</span>
+        <span className="text-amber-600 font-medium">
+          {products.filter(p => getStockStatus(p.current_stock, p.min_stock) !== 'ok').length} perlu restok
+        </span>
+      </div>
+
       {/* Table */}
       <Card>
         {loading ? <LoadingSpinner /> : products.length === 0 ? (
-          <EmptyState icon={<Package size={48} />} title="Belum ada produk" description="Tambahkan produk pertama Anda" />
+          <EmptyState
+            icon={<Package size={48} />}
+            title="Belum ada produk"
+            description="Klik tombol 'Tambah Produk' untuk menambahkan produk pertama"
+            action={
+              <Button icon={<Plus size={16} />} onClick={() => { setEditing(null); setModal('create'); }}>
+                Tambah Produk
+              </Button>
+            }
+          />
         ) : (
-          <Table headers={['Produk', 'SKU', 'Kategori', 'Stok', 'Harga Jual', 'Margin', 'Status', '']}>
+          <Table headers={['Produk', 'SKU', 'Kategori', 'Stok', 'Harga Jual', 'Margin', 'Status', 'Aksi']}>
             {products.map(p => {
               const stockStatus = getStockStatus(p.current_stock, p.min_stock);
               const statusCfg = STOCK_STATUS_CONFIG[stockStatus];
@@ -150,31 +188,44 @@ function ProductList() {
                     <p className="font-medium text-slate-800">{p.name}</p>
                     <p className="text-xs text-slate-400">{p.unit}</p>
                   </Td>
-                  <Td><code className="text-xs bg-slate-100 px-2 py-0.5 rounded">{p.sku || '-'}</code></Td>
+                  <Td>
+                    {p.sku
+                      ? <code className="text-xs bg-slate-100 px-2 py-0.5 rounded">{p.sku}</code>
+                      : <span className="text-slate-300 text-xs">-</span>}
+                  </Td>
                   <Td>
                     {p.category ? (
                       <span className="inline-flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full" style={{ background: p.category.color }} />
+                        <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: p.category.color }} />
                         <span className="text-xs">{p.category.name}</span>
                       </span>
                     ) : <span className="text-slate-300 text-xs">-</span>}
                   </Td>
                   <Td>
-                    <span className={cn('text-sm font-semibold', statusCfg.color)}>{p.current_stock}</span>
+                    <span className={cn('text-sm font-bold', statusCfg.color)}>{p.current_stock}</span>
                     <span className="text-xs text-slate-400 ml-1">{p.unit}</span>
                   </Td>
-                  <Td className="font-medium">{formatCurrency(p.selling_price)}</Td>
-                  <Td><span className={cn('text-sm font-medium', +margin > 30 ? 'text-emerald-600' : 'text-slate-600')}>{margin}%</span></Td>
+                  <Td className="font-medium whitespace-nowrap">{formatCurrency(p.selling_price)}</Td>
+                  <Td>
+                    <span className={cn('text-sm font-semibold', +margin > 20 ? 'text-emerald-600' : 'text-slate-500')}>
+                      {margin}%
+                    </span>
+                  </Td>
                   <Td>
                     <Badge color={statusCfg.color} bg={statusCfg.bg}>{statusCfg.label}</Badge>
                   </Td>
                   <Td>
                     <div className="flex items-center gap-1">
-                      <Button variant="ghost" size="sm" icon={<Edit size={14} />} onClick={() => { setEditing(p); setModal('edit'); }} />
-                      <Button variant="ghost" size="sm" icon={<Trash2 size={14} />}
+                      <Button
+                        variant="ghost" size="sm" icon={<Edit size={14} />}
+                        onClick={() => { setEditing(p); setModal('edit'); }}
+                      />
+                      <Button
+                        variant="ghost" size="sm" icon={<Trash2 size={14} />}
                         className="text-red-400 hover:text-red-600 hover:bg-red-50"
                         loading={deleting === p.id}
-                        onClick={() => handleDelete(p.id)} />
+                        onClick={() => handleDelete(p.id)}
+                      />
                     </div>
                   </Td>
                 </tr>
@@ -188,14 +239,19 @@ function ProductList() {
       <Modal
         open={!!modal}
         onClose={() => { setModal(null); setEditing(null); }}
-        title={modal === 'edit' ? 'Edit Produk' : 'Tambah Produk'}
+        title={modal === 'edit' ? 'Edit Produk' : 'Tambah Produk Baru'}
       >
         <ProductForm
           initial={editing ? {
-            name: editing.name, sku: editing.sku || '', category_id: editing.category_id || '',
-            description: editing.description || '', unit: editing.unit,
-            selling_price: editing.selling_price, cost_price: editing.cost_price,
-            min_stock: editing.min_stock, is_active: editing.is_active,
+            name: editing.name,
+            sku: editing.sku || '',
+            category_id: editing.category_id || '',
+            description: editing.description || '',
+            unit: editing.unit,
+            selling_price: editing.selling_price,
+            cost_price: editing.cost_price,
+            min_stock: editing.min_stock,
+            is_active: editing.is_active,
           } : undefined}
           categories={categories}
           onSave={handleSave}

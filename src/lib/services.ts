@@ -2,7 +2,7 @@ import { supabase } from '../lib/supabase';
 import type {
   Product, ProductFormData,
   Category,
-  Transaction, TransactionFormData, TransactionItem,
+  Transaction, TransactionFormData,
   RestockOrder, RestockFormData,
   Expense, ExpenseFormData, ExpenseCategory,
   StockMovement,
@@ -26,6 +26,7 @@ export const productService = {
     if (filters?.search) query = query.ilike('name', `%${filters.search}%`);
 
     const { data, error } = await query;
+    if (error) console.error('[productService.getAll]', error.message);
     return { data: data as Product[] | null, error: error?.message };
   },
 
@@ -39,21 +40,47 @@ export const productService = {
   },
 
   async create(form: ProductFormData) {
+    // Sanitize: convert empty strings to null for UUID/optional fields
+    const payload = {
+      name: form.name,
+      sku: form.sku || null,
+      category_id: form.category_id || null,
+      description: form.description || null,
+      unit: form.unit || 'pcs',
+      selling_price: Number(form.selling_price) || 0,
+      cost_price: Number(form.cost_price) || 0,
+      min_stock: Number(form.min_stock) || 0,
+      is_active: form.is_active,
+      current_stock: 0,
+    };
     const { data, error } = await supabase
       .from('products')
-      .insert([form])
-      .select()
+      .insert([payload])
+      .select('*, category:categories(*)')
       .single();
+    if (error) console.error('[productService.create]', error.message, JSON.stringify(payload));
     return { data: data as Product | null, error: error?.message };
   },
 
   async update(id: string, form: Partial<ProductFormData>) {
+    const payload: Record<string, unknown> = {};
+    if (form.name !== undefined) payload.name = form.name;
+    if (form.sku !== undefined) payload.sku = form.sku || null;
+    if (form.category_id !== undefined) payload.category_id = form.category_id || null;
+    if (form.description !== undefined) payload.description = form.description || null;
+    if (form.unit !== undefined) payload.unit = form.unit;
+    if (form.selling_price !== undefined) payload.selling_price = Number(form.selling_price);
+    if (form.cost_price !== undefined) payload.cost_price = Number(form.cost_price);
+    if (form.min_stock !== undefined) payload.min_stock = Number(form.min_stock);
+    if (form.is_active !== undefined) payload.is_active = form.is_active;
+
     const { data, error } = await supabase
       .from('products')
-      .update(form)
+      .update(payload)
       .eq('id', id)
-      .select()
+      .select('*, category:categories(*)')
       .single();
+    if (error) console.error('[productService.update]', error.message);
     return { data: data as Product | null, error: error?.message };
   },
 
@@ -62,13 +89,14 @@ export const productService = {
     return { error: error?.message };
   },
 
+  // Fixed: no more broken rpc() in filter
   async getLowStock() {
     const { data, error } = await supabase
       .from('products')
       .select('*, category:categories(*)')
-      .filter('current_stock', 'lte', supabase.rpc('get_min_stock_filter'))
       .eq('is_active', true);
-    return { data: data as Product[] | null, error: error?.message };
+    const filtered = (data || []).filter(p => p.current_stock <= p.min_stock);
+    return { data: filtered as Product[], error: error?.message };
   },
 };
 
@@ -83,6 +111,7 @@ export const categoryService = {
 
   async create(form: { name: string; description?: string; color?: string }) {
     const { data, error } = await supabase.from('categories').insert([form]).select().single();
+    if (error) console.error('[categoryService.create]', error.message);
     return { data: data as Category | null, error: error?.message };
   },
 
@@ -110,7 +139,7 @@ export const stockMovementService = {
     return { data: data as StockMovement[] | null, error: error?.message };
   },
 
-  async getAll(limit = 50) {
+  async getAll(limit = 200) {
     const { data, error } = await supabase
       .from('stock_movements')
       .select('*, product:products(name, sku, unit)')
@@ -141,6 +170,7 @@ export const transactionService = {
     if (filters?.search) query = query.ilike('invoice_number', `%${filters.search}%`);
 
     const { data, error } = await query;
+    if (error) console.error('[transactionService.getAll]', error.message);
     return { data: data as Transaction[] | null, error: error?.message };
   },
 
@@ -156,10 +186,12 @@ export const transactionService = {
   async create(form: TransactionFormData) {
     const invoiceNumber = generateInvoiceNumber();
     const subtotal = form.items.reduce((s, i) => s + i.subtotal, 0);
-    const totalAmount = subtotal - form.discount_amount + form.tax_amount;
-    const changeAmount = form.amount_paid - totalAmount;
+    const discountAmount = Number(form.discount_amount) || 0;
+    const taxAmount = Number(form.tax_amount) || 0;
+    const totalAmount = subtotal - discountAmount + taxAmount;
+    const amountPaid = Number(form.amount_paid) || 0;
+    const changeAmount = amountPaid - totalAmount;
 
-    // Insert transaction
     const { data: txData, error: txError } = await supabase
       .from('transactions')
       .insert([{
@@ -168,10 +200,10 @@ export const transactionService = {
         customer_phone: form.customer_phone || null,
         payment_method: form.payment_method,
         subtotal,
-        discount_amount: form.discount_amount,
-        tax_amount: form.tax_amount,
+        discount_amount: discountAmount,
+        tax_amount: taxAmount,
         total_amount: totalAmount,
-        amount_paid: form.amount_paid,
+        amount_paid: amountPaid,
         change_amount: Math.max(0, changeAmount),
         status: 'completed',
         notes: form.notes || null,
@@ -179,9 +211,11 @@ export const transactionService = {
       .select()
       .single();
 
-    if (txError) return { data: null, error: txError.message };
+    if (txError) {
+      console.error('[transactionService.create] tx error:', txError.message);
+      return { data: null, error: txError.message };
+    }
 
-    // Insert items
     const items = form.items.map(i => ({
       transaction_id: txData.id,
       product_id: i.product.id,
@@ -189,14 +223,17 @@ export const transactionService = {
       quantity: i.quantity,
       unit_price: i.unit_price,
       cost_price: i.product.cost_price,
-      discount_amount: i.discount_amount,
+      discount_amount: i.discount_amount || 0,
       subtotal: i.subtotal,
     }));
 
     const { error: itemsError } = await supabase.from('transaction_items').insert(items);
-    if (itemsError) return { data: null, error: itemsError.message };
+    if (itemsError) {
+      console.error('[transactionService.create] items error:', itemsError.message);
+      return { data: null, error: itemsError.message };
+    }
 
-    // Record stock movements for each item
+    // Stock movements (best-effort, don't block on failure)
     const movements = form.items.map(i => ({
       product_id: i.product.id,
       type: 'out' as const,
@@ -206,8 +243,8 @@ export const transactionService = {
       reference_type: 'transaction' as const,
       notes: `Terjual - ${invoiceNumber}`,
     }));
-
-    await supabase.from('stock_movements').insert(movements);
+    const { error: mvErr } = await supabase.from('stock_movements').insert(movements);
+    if (mvErr) console.error('[transactionService.create] movement error:', mvErr.message);
 
     return { data: txData as Transaction, error: null };
   },
@@ -242,6 +279,7 @@ export const restockService = {
     if (filters?.search) query = query.ilike('order_number', `%${filters.search}%`);
 
     const { data, error } = await query;
+    if (error) console.error('[restockService.getAll]', error.message);
     return { data: data as RestockOrder[] | null, error: error?.message };
   },
 
@@ -267,12 +305,15 @@ export const restockService = {
         status: form.status,
         total_cost: totalCost,
         notes: form.notes || null,
-        received_at: form.status === 'received' ? form.received_at || new Date().toISOString() : null,
+        received_at: form.status === 'received' ? (form.received_at || new Date().toISOString()) : null,
       }])
       .select()
       .single();
 
-    if (orderError) return { data: null, error: orderError.message };
+    if (orderError) {
+      console.error('[restockService.create] order error:', orderError.message);
+      return { data: null, error: orderError.message };
+    }
 
     const items = form.items.map(i => ({
       restock_order_id: orderData.id,
@@ -284,9 +325,12 @@ export const restockService = {
     }));
 
     const { error: itemsError } = await supabase.from('restock_items').insert(items);
-    if (itemsError) return { data: null, error: itemsError.message };
+    if (itemsError) {
+      console.error('[restockService.create] items error:', itemsError.message);
+      return { data: null, error: itemsError.message };
+    }
 
-    // If received, update stock
+    // If received, insert stock-in movements and update cost price
     if (form.status === 'received') {
       const movements = form.items.map(i => ({
         product_id: i.product_id,
@@ -297,9 +341,9 @@ export const restockService = {
         reference_type: 'restock' as const,
         notes: `Restok - ${orderNumber}`,
       }));
-      await supabase.from('stock_movements').insert(movements);
+      const { error: mvErr } = await supabase.from('stock_movements').insert(movements);
+      if (mvErr) console.error('[restockService.create] movement error:', mvErr.message);
 
-      // Update cost price
       for (const item of form.items) {
         await supabase.from('products').update({ cost_price: item.unit_cost }).eq('id', item.product_id);
       }
@@ -339,25 +383,44 @@ export const expenseService = {
     if (filters?.end) query = query.lte('expense_date', filters.end);
 
     const { data, error } = await query;
+    if (error) console.error('[expenseService.getAll]', error.message);
     return { data: data as Expense[] | null, error: error?.message };
   },
 
   async create(form: ExpenseFormData) {
+    const payload = {
+      category_id: form.category_id || null,
+      title: form.title,
+      description: form.description || null,
+      amount: Number(form.amount),
+      payment_method: form.payment_method || 'cash',
+      expense_date: form.expense_date,
+    };
     const { data, error } = await supabase
       .from('expenses')
-      .insert([{ ...form, category_id: form.category_id || null }])
+      .insert([payload])
       .select('*, category:expense_categories(*)')
       .single();
+    if (error) console.error('[expenseService.create]', error.message, JSON.stringify(payload));
     return { data: data as Expense | null, error: error?.message };
   },
 
   async update(id: string, form: Partial<ExpenseFormData>) {
+    const payload: Record<string, unknown> = {};
+    if (form.category_id !== undefined) payload.category_id = form.category_id || null;
+    if (form.title !== undefined) payload.title = form.title;
+    if (form.description !== undefined) payload.description = form.description || null;
+    if (form.amount !== undefined) payload.amount = Number(form.amount);
+    if (form.payment_method !== undefined) payload.payment_method = form.payment_method;
+    if (form.expense_date !== undefined) payload.expense_date = form.expense_date;
+
     const { data, error } = await supabase
       .from('expenses')
-      .update(form)
+      .update(payload)
       .eq('id', id)
       .select('*, category:expense_categories(*)')
       .single();
+    if (error) console.error('[expenseService.update]', error.message);
     return { data: data as Expense | null, error: error?.message };
   },
 
@@ -378,33 +441,32 @@ export const expenseService = {
 export const reportService = {
   async getDashboardSummary(): Promise<{ data: DashboardSummary | null; error: string | null }> {
     const { start, end } = getTodayRange();
+    const todayDate = start.split('T')[0];
 
     const [salesRes, expensesRes, productsRes] = await Promise.all([
       supabase
         .from('transactions')
-        .select('total_amount, subtotal, items:transaction_items(quantity, cost_price)')
+        .select('total_amount, items:transaction_items(quantity, cost_price)')
         .eq('status', 'completed')
         .gte('created_at', start)
         .lte('created_at', end),
       supabase
         .from('expenses')
         .select('amount')
-        .eq('expense_date', start.split('T')[0]),
+        .eq('expense_date', todayDate),
       supabase
         .from('products')
-        .select('current_stock, min_stock, is_active')
+        .select('current_stock, min_stock')
         .eq('is_active', true),
     ]);
 
-    if (salesRes.error) return { data: null, error: salesRes.error.message };
-
-    const totalSales = (salesRes.data || []).reduce((s, t) => s + t.total_amount, 0);
+    const totalSales = (salesRes.data || []).reduce((s, t) => s + (t.total_amount || 0), 0);
     const totalTransactions = salesRes.data?.length || 0;
-    const totalExpenses = (expensesRes.data || []).reduce((s, e) => s + e.amount, 0);
+    const totalExpenses = (expensesRes.data || []).reduce((s, e) => s + (e.amount || 0), 0);
 
     const cogs = (salesRes.data || []).reduce((s, t) => {
-      const itemsCost = (t.items || []).reduce((is: number, i: { quantity: number; cost_price: number }) => is + i.quantity * i.cost_price, 0);
-      return s + itemsCost;
+      return s + (t.items || []).reduce((is: number, i: { quantity: number; cost_price: number }) =>
+        is + (i.quantity * i.cost_price), 0);
     }, 0);
     const grossProfit = totalSales - cogs;
     const estimatedProfit = grossProfit - totalExpenses;
@@ -440,17 +502,15 @@ export const reportService = {
 
     if (error) return { data: [], error: error.message };
 
-    // Group by date
     const map: Record<string, SalesReport> = {};
     for (const t of data || []) {
       const date = t.created_at.split('T')[0];
-      if (!map[date]) {
-        map[date] = { date, total_sales: 0, total_transactions: 0, total_profit: 0 };
-      }
-      map[date].total_sales += t.total_amount;
+      if (!map[date]) map[date] = { date, total_sales: 0, total_transactions: 0, total_profit: 0 };
+      map[date].total_sales += t.total_amount || 0;
       map[date].total_transactions += 1;
-      const cogs = (t.items || []).reduce((s: number, i: { quantity: number; cost_price: number }) => s + i.quantity * i.cost_price, 0);
-      map[date].total_profit += t.total_amount - cogs;
+      const cogs = (t.items || []).reduce((s: number, i: { quantity: number; cost_price: number }) =>
+        s + i.quantity * i.cost_price, 0);
+      map[date].total_profit += (t.total_amount || 0) - cogs;
     }
 
     return { data: Object.values(map).sort((a, b) => a.date.localeCompare(b.date)), error: null };
@@ -473,7 +533,7 @@ export const reportService = {
       const name = cat?.name || 'Tidak Berkategori';
       const color = cat?.color || '#6b7280';
       if (!map[name]) map[name] = { category: name, total: 0, color };
-      map[name].total += e.amount;
+      map[name].total += e.amount || 0;
     }
 
     return { data: Object.values(map), error: null };
@@ -502,11 +562,11 @@ export const reportService = {
           .lte('expense_date', end.split('T')[0]),
       ]);
 
-      const revenue = (salesRes.data || []).reduce((s, t) => s + t.total_amount, 0);
-      const cogs = (salesRes.data || []).reduce((s, t) => {
-        return s + (t.items || []).reduce((is: number, i: { quantity: number; cost_price: number }) => is + i.quantity * i.cost_price, 0);
-      }, 0);
-      const expenses = (expRes.data || []).reduce((s, e) => s + e.amount, 0);
+      const revenue = (salesRes.data || []).reduce((s, t) => s + (t.total_amount || 0), 0);
+      const cogs = (salesRes.data || []).reduce((s, t) =>
+        s + (t.items || []).reduce((is: number, i: { quantity: number; cost_price: number }) =>
+          is + i.quantity * i.cost_price, 0), 0);
+      const expenses = (expRes.data || []).reduce((s, e) => s + (e.amount || 0), 0);
       const grossProfit = revenue - cogs;
       const netProfit = grossProfit - expenses;
 
