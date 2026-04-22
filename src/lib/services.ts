@@ -529,9 +529,12 @@ export const reportService = {
 
     const map: Record<string, ExpenseReport> = {};
     for (const e of data || []) {
-      const cat = (e.category as { name: string; color: string } | null);
+      const catArr = e.category as { name: string; color: string }[] | null;
+      const cat = catArr?.[0];
+
       const name = cat?.name || 'Tidak Berkategori';
       const color = cat?.color || '#6b7280';
+
       if (!map[name]) map[name] = { category: name, total: 0, color };
       map[name].total += e.amount || 0;
     }
